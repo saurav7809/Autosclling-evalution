@@ -1,0 +1,13 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+psutil==7.0.0
+httpx==0.28.1
+docker>=7.1,<8
+prometheus-fastapi-instrumentator==7.1.0
+kubernetes>=29.0.0,<32
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+bcrypt>=3.2.0,<4.0.0
+
+
