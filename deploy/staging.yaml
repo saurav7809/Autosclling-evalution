@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: autoscaling-staging
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscaling-evaluator
+  namespace: autoscaling-staging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: autoscaling-evaluator
+  namespace: autoscaling-staging
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["benchmark-app"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["benchmark-app"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: ["benchmark-app"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autoscaling-evaluator
+  namespace: autoscaling-staging
+subjects:
+  - kind: ServiceAccount
+    name: autoscaling-evaluator
+    namespace: autoscaling-staging
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: autoscaling-evaluator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-app
+  namespace: autoscaling-staging
+  labels:
+    autoscaling-evaluation/staging: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benchmark-app
+  template:
+    metadata:
+      labels:
+        app: benchmark-app
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - name: app
+          image: registry.k8s.io/hpa-example
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 200m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          readinessProbe:
+            tcpSocket:
+              port: 80
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: benchmark-app
+  namespace: autoscaling-staging
+  labels:
+    autoscaling-evaluation/staging: "true"
+spec:
+  type: ClusterIP
+  selector:
+    app: benchmark-app
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: autoscaling-evaluator-data
+  namespace: autoscaling-staging
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaling-evaluator
+  namespace: autoscaling-staging
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: autoscaling-evaluator
+  template:
+    metadata:
+      labels:
+        app: autoscaling-evaluator
+    spec:
+      serviceAccountName: autoscaling-evaluator
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: api
+          image: autoscaling-evaluation:staging
+          imagePullPolicy: IfNotPresent
+          command: ["uvicorn"]
+          args: ["app:app", "--host", "0.0.0.0", "--port", "8080", "--timeout-graceful-shutdown", "5"]
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: autoscaling-evaluator
+          env:
+            - name: STAGING_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STAGING_DEPLOYMENT
+              value: benchmark-app
+            - name: STAGING_SERVICE
+              value: benchmark-app
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: autoscaling-evaluator-data

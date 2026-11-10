@@ -1,6 +1,6 @@
 # Autoscaling Evaluation
 
-This FastAPI service compares CPU, request-trend, and latency policies for containerized workloads. Simulations compare each policy with a fixed-replica baseline. Prometheus replay shows the scaling decisions each policy would make from the same observed telemetry.
+This FastAPI service compares CPU, request-trend, and latency policies for containerized workloads. A live staging benchmark applies each policy to a Kubernetes Deployment and streams measurements from real HTTP requests. Simulation compares policies under a model, and Prometheus replay shows the decisions each policy would make from the same observed telemetry.
 
 ## Quickstart
 
@@ -79,6 +79,70 @@ Set **PROMETHEUS_URL** to a reachable Prometheus base URL before starting the AP
 Use **mode: TELEMETRY_REPLAY** when creating an experiment, or **mode: SIMULATION** to simulate even with Prometheus configured. Requests that omit **mode** use replay when Prometheus is configured and simulation otherwise.
 
 Replay reports include data coverage and the missing-window count for each metric. Insufficient coverage produces a **FAILED** run with a reason. Replay results report observed metrics and recommended replica counts, with a null evaluation score. They use the same observations for every policy. Pre-upgrade replay reports have **UNVERIFIED** coverage.
+
+## Run a live Kubernetes benchmark
+
+Use a staging Kubernetes context with Metrics Server and a default StorageClass for the evaluator's SQLite volume. The [staging manifest](deploy/staging.yaml) sets up a CPU-workload demo app, an internal Service, and a single evaluator with permission to scale that Deployment. The target must carry the **autoscaling-evaluation/staging=true** label on both the Deployment and its matching ClusterIP Service. A HorizontalPodAutoscaler on the target blocks the benchmark.
+
+Build the evaluator image and make it available to the staging cluster. For a kind cluster, load the local image with the second command. For a registry-backed cluster, publish the image to the registry and set the evaluator image in the manifest.
+
+~~~sh
+docker build -t autoscaling-evaluation:staging backend
+kind load docker-image autoscaling-evaluation:staging --name YOUR_STAGING_CLUSTER
+~~~
+
+Create the namespace and the evaluator Secret once in the staging context. Generate distinct random values for the two keys.
+
+~~~sh
+kubectl config current-context
+kubectl create namespace autoscaling-staging
+export JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export STAGING_OPERATOR_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+kubectl -n autoscaling-staging create secret generic autoscaling-evaluator \
+  --from-literal="JWT_SECRET=$JWT_SECRET" \
+  --from-literal="STAGING_OPERATOR_TOKEN=$STAGING_OPERATOR_TOKEN"
+kubectl apply -f deploy/staging.yaml
+kubectl -n autoscaling-staging rollout status deployment/benchmark-app
+kubectl -n autoscaling-staging rollout status deployment/autoscaling-evaluator
+kubectl -n autoscaling-staging port-forward deployment/autoscaling-evaluator 8080:8080
+~~~
+
+Sign in through the [interactive API docs](http://localhost:8080/docs) and register **registry.k8s.io/hpa-example** as the image reference. Submit the following body to **POST /api/v1/experiments** with the bearer token and **X-Staging-Token** set to the staging operator token.
+
+~~~json
+{
+  "name": "Live staging spike",
+  "image_ref": "registry.k8s.io/hpa-example",
+  "mode": "STAGING_BENCHMARK",
+  "workload": "SPIKE",
+  "duration_seconds": 60,
+  "sample_interval_seconds": 5,
+  "min_replicas": 1,
+  "max_replicas": 4,
+  "baseline_replicas": 2,
+  "target_latency": 250,
+  "staging": {
+    "base_rps": 2,
+    "peak_rps": 10,
+    "warmup_seconds": 20,
+    "cooldown_seconds": 10,
+    "target_error_percent": 1
+  }
+}
+~~~
+
+The evaluator runs each policy and the fixed-replica baseline sequentially. Each trial sets its starting replica count, waits for ready replicas, warms up, and sends the same paced spike to the Service. The live mode supports up to 20 requests per second, eight replicas, and 120 seconds of measured traffic per trial. For a different staging workload, configure **STAGING_NAMESPACE**, **STAGING_DEPLOYMENT**, **STAGING_SERVICE**, and, if needed, **STAGING_SERVICE_PORT** and **STAGING_REQUEST_PATH**. Update the Role to match and run a single evaluator per target with durable storage. The image reference in the request must match the Deployment.
+
+Follow the experiment with **GET /api/v1/experiments/{id}/stream** using the bearer token. The stream emits **sample** events with measured p95 latency, HTTP failures, CPU, and requested, ready, and active replica counts. **report** events show the current phase, finished trials, and restoration status. Reconnect with **Last-Event-ID** to resume the samples.
+
+~~~sh
+curl -N -H "Authorization: Bearer $ACCESS_TOKEN" \
+  "http://localhost:8080/api/v1/experiments/$EXPERIMENT_ID/stream"
+~~~
+
+**GET /api/v1/experiments/{id}/compare** updates as trials finish. The final report identifies the policies or baseline that met both latency and error targets with the lowest replica-minutes. Latency is measured from successful requests, and errors include unsuccessful responses and timeouts. The trend policy uses the rate of observed HTTP responses. Replica-minutes are estimated from sampled active replicas. CPU and trend trials need fresh workload CPU metrics in at least 80% of windows to qualify for a recommendation. A missing measurement is represented by null.
+
+The evaluator saves the original desired replica count before making a scale change. It restores that count after the run or resumes restoration from SQLite after a restart. A pending restoration keeps the target reserved. If another controller or operator has changed the target, resolve that conflict and restore the original count shown in the report. Retry a failed live run with the original target configuration and the staging operator token.
 
 ## Recover interrupted or failed runs
 

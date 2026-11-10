@@ -1,9 +1,11 @@
 from __future__ import annotations
 import asyncio, json, os, re, shutil, sqlite3, subprocess, time, uuid
+import hmac
 import logging
 import math
 from collections.abc import Iterator
 from contextlib import asynccontextmanager, closing, contextmanager
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, NamedTuple, Optional
@@ -11,7 +13,7 @@ from typing import Literal, NamedTuple, Optional
 import psutil
 import docker
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from prometheus_fastapi_instrumentator import Instrumentator
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -19,6 +21,8 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator, model_validator
 from jose import jwt as jose_jwt, JWTError
 from passlib.context import CryptContext
+
+import staging
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 DB_PATH = DATA_DIR / "autoscaling.db"
@@ -154,6 +158,19 @@ def init_db() -> None:
           created_at TEXT NOT NULL,
           role TEXT NOT NULL DEFAULT 'user'
         );
+        CREATE TABLE IF NOT EXISTS staging_runs (
+          experiment_id TEXT PRIMARY KEY REFERENCES experiments(id),
+          target_key TEXT NOT NULL, target_json TEXT NOT NULL, progress_json TEXT NOT NULL,
+          deployment_uid TEXT, original_replicas INTEGER, last_replicas INTEGER, pending_replicas INTEGER,
+          restore_state TEXT NOT NULL DEFAULT 'PENDING', restore_error TEXT, restore_lease REAL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_staging_active_target
+          ON staging_runs(target_key) WHERE restore_state='PENDING';
+        CREATE TABLE IF NOT EXISTS staging_samples (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT NOT NULL REFERENCES experiments(id),
+          sample_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_staging_samples_experiment ON staging_samples(experiment_id, id);
         """)
         # Serialize schema inspection and upgrades across processes sharing the database.
         c.execute("BEGIN IMMEDIATE")
@@ -204,11 +221,12 @@ def interrupt_expired_experiments() -> None:
 
 async def watch_experiment_leases():
     while True:
-        await asyncio.sleep(5)
         try:
             interrupt_expired_experiments()
+            await recover_staging_runs()
         except sqlite3.Error:
             logger.exception("Could not check experiment leases")
+        await asyncio.sleep(5)
 
 
 def prometheus_value(response: httpx.Response) -> float | None:
@@ -320,6 +338,20 @@ class ImageRegistration(BaseModel):
             raise ValueError("Use a valid image reference, e.g. nginx:1.27 or ghcr.io/org/app:1.0")
         return v
 
+class StagingOptions(BaseModel):
+    base_rps: int = Field(default=2, ge=1, le=staging.MAX_RPS)
+    peak_rps: int = Field(default=10, ge=2, le=staging.MAX_RPS)
+    warmup_seconds: int = Field(default=20, ge=5, le=30)
+    cooldown_seconds: int = Field(default=10, ge=1, le=60)
+    target_error_percent: float = Field(default=1.0, ge=0, le=25)
+
+    @model_validator(mode="after")
+    def validate_spike(self) -> StagingOptions:
+        if self.peak_rps <= self.base_rps:
+            raise ValueError("peak_rps must exceed base_rps")
+        return self
+
+
 class ExperimentCreate(BaseModel):
     name: str = Field(min_length=3, max_length=100)
     image_ref: str = Field(min_length=3, max_length=255)
@@ -333,8 +365,9 @@ class ExperimentCreate(BaseModel):
     target_cpu: float = Field(default=65, ge=10, le=95)
     target_latency: float = Field(default=250, ge=10, le=10000)
     sample_interval_seconds: int = Field(default=2, ge=1, le=10)
-    mode: Literal["SIMULATION", "TELEMETRY_REPLAY"] | None = None
+    mode: Literal["SIMULATION", "TELEMETRY_REPLAY", "STAGING_BENCHMARK"] | None = None
     baseline_replicas: int | None = Field(default=None, ge=1, le=100)
+    staging: StagingOptions | None = None
 
     @model_validator(mode="after")
     def validate_replica_bounds(self) -> ExperimentCreate:
@@ -342,6 +375,13 @@ class ExperimentCreate(BaseModel):
             raise ValueError("max_replicas must be >= min_replicas")
         if self.baseline_replicas is not None and not self.min_replicas <= self.baseline_replicas <= self.max_replicas:
             raise ValueError("baseline_replicas must be between min_replicas and max_replicas")
+        if self.mode == staging.MODE:
+            if self.workload != "SPIKE" and "workload" in self.model_fields_set:
+                raise ValueError("Staging benchmarks use the SPIKE workload")
+            if self.duration_seconds > 120 or self.max_replicas > staging.MAX_REPLICAS:
+                raise ValueError(f"Staging trials support at most 120 seconds and {staging.MAX_REPLICAS} replicas")
+        elif self.staging is not None:
+            raise ValueError("Staging options require STAGING_BENCHMARK mode")
         return self
 
 class MetricIngest(BaseModel):
@@ -537,6 +577,8 @@ def delete_image(image_id: str):
             raise HTTPException(404, "Image registration not found")
 
 def experiment_mode(source: str) -> str:
+    if source == staging.SOURCE:
+        return staging.MODE
     return "TELEMETRY_REPLAY" if source == "PROMETHEUS" else "SIMULATION"
 
 
@@ -575,6 +617,28 @@ def experiment_response(row: sqlite3.Row, *, include_config: bool = False) -> di
     return item
 
 
+def staging_info(c: sqlite3.Connection, experiment_id: str) -> dict | None:
+    row = c.execute("SELECT * FROM staging_runs WHERE experiment_id=?", (experiment_id,)).fetchone()
+    if row is None:
+        return None
+    return {
+        "target": json.loads(row["target_json"]),
+        "progress": json.loads(row["progress_json"]),
+        "restoration": {
+            "status": row["restore_state"], "error": row["restore_error"],
+            "original_replicas": row["original_replicas"],
+        },
+    }
+
+
+def staging_samples(c: sqlite3.Connection, experiment_id: str, after_id: int = 0, limit: int = -1) -> list[dict]:
+    rows = c.execute(
+        "SELECT id,sample_json FROM staging_samples WHERE experiment_id=? AND id>? ORDER BY id LIMIT ?",
+        (experiment_id, after_id, limit),
+    )
+    return [json.loads(row["sample_json"]) | {"id": row["id"]} for row in rows]
+
+
 @app.get("/api/v1/experiments")
 def list_experiments():
     with db() as c:
@@ -586,10 +650,18 @@ def get_experiment(experiment_id: str):
     with db() as c:
         exp = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
         if not exp: raise HTTPException(404, "Experiment not found")
-        samples = c.execute("SELECT * FROM samples WHERE experiment_id=? ORDER BY id", (experiment_id,)).fetchall()
+        live = staging_info(c, experiment_id) if exp["source"] == staging.SOURCE else None
+        if live is not None:
+            samples = staging_samples(c, experiment_id)
+        else:
+            samples = [dict(row) for row in c.execute(
+                "SELECT * FROM samples WHERE experiment_id=? ORDER BY id", (experiment_id,),
+            )]
         events = c.execute("SELECT * FROM scaling_events WHERE experiment_id=? ORDER BY id", (experiment_id,)).fetchall()
     item = experiment_response(exp, include_config=True)
-    item["samples"] = [rowdict(x) for x in samples]
+    if live is not None:
+        item["staging"] = live
+    item["samples"] = samples
     item["scaling_events"] = [rowdict(x) for x in events]
     return item
 
@@ -601,9 +673,11 @@ def workload_rate(kind: str, pct: float) -> float:
     return 25 + 175 * pct
 
 
-def choose_replicas(strategy: str, cpu: float, latency: float, rates: list[float], current: int,
+def choose_replicas(strategy: str, cpu: float | None, latency: float | None, rates: list[float], current: int,
                     mn: int, mx: int, target_cpu: float, target_latency: float) -> tuple[int, str]:
     """Deterministic policies so identical workload inputs are comparable."""
+    if strategy in {"CPU", "TREND"} and cpu is None:
+        return current, "Waiting for workload CPU telemetry"
     if strategy == "CPU":
         desired = round(current * cpu / max(target_cpu, 1))
         reason = f"CPU {cpu:.1f}% versus target {target_cpu:.1f}%"
@@ -615,6 +689,8 @@ def choose_replicas(strategy: str, cpu: float, latency: float, rates: list[float
         desired = current + (1 if rising and cpu > target_cpu * .70 else -1 if falling and cpu < target_cpu * .85 else 0)
         reason = "Request-rate trend rising" if desired > current else "Request-rate trend falling" if desired < current else "Request-rate trend stable"
     else:
+        if latency is None:
+            return current, "Waiting for successful latency measurements"
         desired = current + (1 if latency > target_latency else -1 if latency < target_latency * .55 else 0)
         reason = f"Latency {latency:.1f} ms versus target {target_latency:.1f} ms"
     return max(mn, min(mx, desired)), reason
@@ -806,6 +882,251 @@ async def run_experiment_real(experiment_id: str, config: dict) -> tuple[dict | 
     return results, quality
 
 
+def set_staging_progress(experiment_id: str, progress: dict, results: dict | None = None) -> None:
+    with db() as c:
+        renew_experiment_lease(c, experiment_id)
+        c.execute("UPDATE staging_runs SET progress_json=? WHERE experiment_id=?", (json.dumps(progress), experiment_id))
+        if results is not None:
+            c.execute("UPDATE experiments SET results_json=? WHERE id=?", (json.dumps(results), experiment_id))
+
+
+async def resize_staging(
+    experiment_id: str, cluster: staging.KubernetesStaging, uid: str, current: int, desired: int,
+) -> None:
+    if current == desired:
+        return
+    with db() as c:
+        renew_experiment_lease(c, experiment_id)
+        c.execute("UPDATE staging_runs SET pending_replicas=? WHERE experiment_id=?", (desired, experiment_id))
+    await staging.apply_scale(cluster, uid, (current,), desired)
+    with db() as c:
+        renew_experiment_lease(c, experiment_id)
+        c.execute(
+            "UPDATE staging_runs SET last_replicas=?, pending_replicas=NULL WHERE experiment_id=?",
+            (desired, experiment_id),
+        )
+
+
+async def restore_staging_target(experiment_id: str) -> bool:
+    now = time.time()
+    lease = now + EXPERIMENT_LEASE_SECONDS
+    with db() as c:
+        row = c.execute(
+            "UPDATE staging_runs SET restore_lease=? WHERE experiment_id=? AND restore_state='PENDING' "
+            "AND (restore_lease IS NULL OR restore_lease<=?) RETURNING *",
+            (lease, experiment_id, now),
+        ).fetchone()
+    if row is None:
+        return False
+
+    error = None
+    status = "NOT_NEEDED"
+    if row["original_replicas"] is not None:
+        try:
+            target = staging.StagingTarget.configured()
+            if target is None or asdict(target) != json.loads(row["target_json"]):
+                raise staging.StagingError("Restore the original staging target configuration to retry restoration.")
+            original = row["original_replicas"]
+            allowed = tuple(count for count in (original, row["last_replicas"], row["pending_replicas"]) if count is not None)
+            cluster = staging.KubernetesStaging(target)
+            try:
+                await staging.apply_scale(cluster, row["deployment_uid"], allowed, original)
+            finally:
+                cluster.close()
+            status = "RESTORED"
+        except staging.TargetChanged as exc:
+            status, error = "TARGET_CHANGED", str(exc)
+        except staging.StagingError as exc:
+            status, error = "PENDING", str(exc)
+        except Exception:
+            logger.exception("Could not restore the staging Deployment for %s", experiment_id)
+            status, error = "PENDING", "Kubernetes restoration failed. Check cluster access and server logs."
+    with db() as c:
+        c.execute(
+            "UPDATE staging_runs SET restore_state=?, restore_error=?, restore_lease=NULL "
+            "WHERE experiment_id=? AND restore_lease=?",
+            (status, error, experiment_id, lease),
+        )
+    return status in {"RESTORED", "NOT_NEEDED"}
+
+
+async def recover_staging_runs() -> None:
+    with db() as c:
+        experiments = c.execute(
+            "SELECT s.experiment_id FROM staging_runs s JOIN experiments e ON e.id=s.experiment_id "
+            "WHERE s.restore_state='PENDING' AND e.status IN ('FAILED','INTERRUPTED','COMPLETED') "
+            "AND (s.restore_lease IS NULL OR s.restore_lease<=?)",
+            (time.time(),),
+        ).fetchall()
+    for row in experiments:
+        await restore_staging_target(row["experiment_id"])
+
+
+async def wait_staging_ready(
+    experiment_id: str, cluster: staging.KubernetesStaging, uid: str, desired: int,
+) -> None:
+    clock = asyncio.get_running_loop()
+    deadline = clock.time() + 60
+    while clock.time() < deadline:
+        with db() as c:
+            renew_experiment_lease(c, experiment_id)
+        snapshot = await asyncio.to_thread(cluster.snapshot, uid)
+        if snapshot.requested != desired:
+            raise staging.StagingError("The Deployment's requested replica count changed outside the benchmark.")
+        if snapshot.settled:
+            return
+        await asyncio.sleep(1)
+    raise staging.StagingError("The staging replicas did not become ready within 60 seconds.")
+
+
+def save_staging_sample(experiment_id: str, sample: dict, progress: dict) -> None:
+    with db() as c:
+        renew_experiment_lease(c, experiment_id)
+        c.execute(
+            "INSERT INTO staging_samples(experiment_id,sample_json) VALUES(?,?)",
+            (experiment_id, json.dumps(sample)),
+        )
+        c.execute("UPDATE staging_runs SET progress_json=? WHERE experiment_id=?", (json.dumps(progress), experiment_id))
+        if sample["scale_applied"]:
+            c.execute(
+                "INSERT INTO scaling_events(experiment_id,timestamp,strategy,previous_replicas,"
+                "desired_replicas,reason,source) VALUES(?,?,?,?,?,?,?)",
+                (experiment_id, sample["timestamp"], sample["strategy"], sample["requested_replicas"],
+                 sample["next_replicas"], sample["decision"], staging.SOURCE),
+            )
+
+
+async def run_staging_trial(
+    experiment_id: str, config: dict, progress: dict, cluster: staging.KubernetesStaging,
+    uid: str, requested: int, http: httpx.AsyncClient,
+) -> tuple[dict, int]:
+    options = config["staging"]
+    strategy = progress["strategy"]
+    windows = staging.traffic_windows(
+        config["duration_seconds"], config["sample_interval_seconds"], options["base_rps"], options["peak_rps"],
+    )
+    clock = asyncio.get_running_loop()
+    started = clock.time() + 0.05
+    ends = started + config["duration_seconds"]
+    traffic = [
+        asyncio.create_task(staging.measure_window(http, cluster.target.url, started + window.offset, window))
+        for window in windows
+    ]
+    last_change = float("-inf")
+    rates, samples, latencies = [], [], []
+    try:
+        for index, (window, requests) in enumerate(zip(windows, traffic)):
+            elapsed = window.offset + window.seconds
+            await asyncio.sleep(max(0, started + elapsed - clock.time()))
+            outcomes = await requests
+            observed = await asyncio.to_thread(cluster.snapshot, uid, True)
+            if observed.requested != requested:
+                raise staging.StagingError("The Deployment's requested replica count changed outside the benchmark.")
+            successful = [outcome.latency_ms for outcome in outcomes if outcome.latency_ms is not None]
+            responses = sum(outcome.responded for outcome in outcomes)
+            latencies.extend(successful)
+            p95_latency = staging.p95(successful)
+            rates.append(responses / window.seconds)
+            desired = requested
+            if strategy == "BASELINE":
+                reason = "Fixed replica baseline"
+            elif index == len(windows) - 1 or clock.time() >= ends:
+                reason = "Trial measurement finished"
+            elif not observed.settled:
+                reason = "Waiting for requested replicas to become ready"
+            elif clock.time() - last_change < options["cooldown_seconds"]:
+                reason = "Scaling cooldown"
+            else:
+                desired, reason = choose_replicas(
+                    strategy, observed.cpu_percent, p95_latency, rates, requested,
+                    config["min_replicas"], config["max_replicas"], config["target_cpu"], config["target_latency"],
+                )
+            applied = desired != requested
+            if applied:
+                await resize_staging(experiment_id, cluster, uid, requested, desired)
+                last_change = clock.time()
+            sample = {
+                "experiment_id": experiment_id, "timestamp": now_iso(), "source": staging.SOURCE,
+                "strategy": strategy, "phase": window.phase, "elapsed_seconds": elapsed,
+                "window_seconds": window.seconds, "offered_rps": window.rps, "request_rate": rates[-1],
+                "requests": len(outcomes), "responses": responses, "failed_requests": len(outcomes) - len(successful),
+                "error_rate_percent": round(100 * (len(outcomes) - len(successful)) / len(outcomes), 3),
+                "p95_latency_ms": p95_latency, "cpu_percent": observed.cpu_percent,
+                "requested_replicas": requested, "ready_replicas": observed.ready, "active_replicas": observed.active,
+                "next_replicas": desired, "decision": reason, "scale_applied": applied,
+            }
+            samples.append(sample)
+            save_staging_sample(experiment_id, sample, progress | {"elapsed_seconds": elapsed})
+            requested = desired
+    finally:
+        for task in traffic:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*traffic, return_exceptions=True)
+    result = staging.trial_summary(strategy, samples, latencies, config)
+    if strategy == "BASELINE":
+        result["fixed_replicas"] = config["baseline_replicas"]
+    return result, requested
+
+
+async def warmup_staging(http: httpx.AsyncClient, target: staging.StagingTarget, options: dict) -> None:
+    clock = asyncio.get_running_loop()
+    start = clock.time()
+    window = staging.TrafficWindow(0, options["warmup_seconds"], options["base_rps"], "WARMUP")
+    measured = await staging.measure_window(http, target.url, start, window)
+    if not any(outcome.latency_ms is not None for outcome in measured):
+        raise staging.StagingError("The staging Service returned no successful requests during warm-up.")
+    await asyncio.sleep(max(0, start + window.seconds - clock.time()))
+
+
+async def run_staging_benchmark(experiment_id: str, config: dict) -> tuple[dict, dict]:
+    target = staging.StagingTarget(**config["staging_target"])
+    strategies = (*config["strategies"], "BASELINE")
+    progress = {"phase": "PREFLIGHT", "finished_trials": 0, "total_trials": len(strategies)}
+    set_staging_progress(experiment_id, progress)
+    cluster = staging.KubernetesStaging(target)
+    try:
+        original = await asyncio.to_thread(cluster.preflight, config["image_ref"])
+        with db() as c:
+            renew_experiment_lease(c, experiment_id)
+            c.execute(
+                "UPDATE staging_runs SET deployment_uid=?, original_replicas=?, last_replicas=? WHERE experiment_id=?",
+                (original.uid, original.requested, original.requested, experiment_id),
+            )
+        requested = original.requested
+        results = {}
+        limits = httpx.Limits(max_connections=staging.MAX_RPS * (staging.HTTP_TIMEOUT + 1), max_keepalive_connections=0)
+        async with httpx.AsyncClient(limits=limits, trust_env=False, follow_redirects=False) as http:
+            for strategy in strategies:
+                progress = {
+                    "strategy": strategy, "phase": "RESETTING", "finished_trials": len(results),
+                    "total_trials": len(strategies), "elapsed_seconds": 0,
+                }
+                set_staging_progress(experiment_id, progress)
+                initial = config["baseline_replicas"] if strategy == "BASELINE" else config["min_replicas"]
+                await resize_staging(experiment_id, cluster, original.uid, requested, initial)
+                await wait_staging_ready(experiment_id, cluster, original.uid, initial)
+                set_staging_progress(experiment_id, progress | {"phase": "WARMUP"})
+                await warmup_staging(http, target, config["staging"])
+                progress["phase"] = "MEASURING"
+                set_staging_progress(experiment_id, progress)
+                result, requested = await run_staging_trial(experiment_id, config, progress, cluster, original.uid, initial, http)
+                results[strategy] = result
+                set_staging_progress(
+                    experiment_id, progress | {
+                        "phase": "TRIAL_COMPLETE", "finished_trials": len(results),
+                        "elapsed_seconds": config["duration_seconds"],
+                    }, results,
+                )
+        set_staging_progress(experiment_id, {"phase": "RESTORING", "finished_trials": len(results), "total_trials": len(strategies)})
+        coverage = {strategy: result["cpu_coverage"] for strategy, result in results.items()}
+        incomplete = [strategy for strategy, result in results.items() if result["quality"] != "COMPLETE"]
+        quality = {"status": "PARTIAL" if incomplete else "COMPLETE", "cpu_coverage": coverage, "insufficient_cpu": incomplete}
+        return results, quality
+    finally:
+        cluster.close()
+
+
 async def execute_experiment(experiment_id: str, config: dict) -> None:
     try:
         now = time.time()
@@ -827,10 +1148,23 @@ async def execute_experiment(experiment_id: str, config: dict) -> None:
                 )
                 end_failed_experiment(experiment_id, "FAILED", error, quality)
                 return
+        elif config["mode"] == staging.MODE:
+            try:
+                results, quality = await run_staging_benchmark(experiment_id, config)
+            finally:
+                restored = await restore_staging_target(experiment_id)
+            if not restored:
+                raise staging.StagingError("The staging Deployment could not be restored. Check the restoration status.")
         else:
             results = await run_experiment(experiment_id, config)
         with db() as c:
             renew_experiment_lease(c, experiment_id)
+            if config["mode"] == staging.MODE:
+                progress = {"phase": "FINISHED", "finished_trials": len(results), "total_trials": len(results)}
+                c.execute(
+                    "UPDATE staging_runs SET progress_json=? WHERE experiment_id=?",
+                    (json.dumps(progress), experiment_id),
+                )
             c.execute(
                 "UPDATE experiments SET status='COMPLETED', completed_at=?, results_json=?, "
                 "lease_until=NULL, data_quality_json=? WHERE id=?",
@@ -841,6 +1175,8 @@ async def execute_experiment(experiment_id: str, config: dict) -> None:
         raise
     except ExperimentInterrupted:
         end_failed_experiment(experiment_id, "INTERRUPTED", INTERRUPTED_MESSAGE)
+    except staging.StagingError as exc:
+        end_failed_experiment(experiment_id, "FAILED", str(exc))
     except Exception:
         logger.exception("Experiment %s failed", experiment_id)
         end_failed_experiment(experiment_id, "FAILED", "The experiment failed. Check server logs before retrying.")
@@ -848,6 +1184,12 @@ async def execute_experiment(experiment_id: str, config: dict) -> None:
 
 def experiment_receipt(experiment_id: str, status: str, source: str, retry_of: str | None) -> dict:
     mode = experiment_mode(source)
+    if mode == staging.MODE:
+        return {
+            "id": experiment_id, "status": status, "source": source, "mode": mode, "retry_of": retry_of,
+            "message": "Live staging trials send real HTTP requests and stream measured results.",
+            "stream_url": f"/api/v1/experiments/{experiment_id}/stream",
+        }
     message = (
         "This run collects Prometheus observations and then replays each policy against the shared trace."
         if mode == "TELEMETRY_REPLAY" else
@@ -856,7 +1198,22 @@ def experiment_receipt(experiment_id: str, status: str, source: str, retry_of: s
     return {"id": experiment_id, "status": status, "source": source, "mode": mode, "message": message, "retry_of": retry_of}
 
 
-def queue_experiment(payload: ExperimentCreate, *, retry_of: str | None = None) -> dict:
+def authorize_staging(token: str | None) -> staging.StagingTarget:
+    try:
+        target = staging.StagingTarget.configured()
+    except staging.StagingError as exc:
+        raise HTTPException(503, str(exc)) from None
+    expected = os.getenv("STAGING_OPERATOR_TOKEN", "").encode("utf-8")
+    if target is None or len(expected) < 32:
+        raise HTTPException(503, "Configure a staging target and STAGING_OPERATOR_TOKEN to enable live benchmarks.")
+    if token is None or not hmac.compare_digest(token.encode("utf-8"), expected):
+        raise HTTPException(403, "A valid X-Staging-Token is required to start a live benchmark.")
+    return target
+
+
+def queue_experiment(
+    payload: ExperimentCreate, *, retry_of: str | None = None, live_target: staging.StagingTarget | None = None,
+) -> dict:
     cfg = payload.model_dump()
     cfg["strategies"] = list(dict.fromkeys(cfg["strategies"]))
     mode = cfg["mode"] or ("TELEMETRY_REPLAY" if PROMETHEUS_URL else "SIMULATION")
@@ -872,12 +1229,23 @@ def queue_experiment(payload: ExperimentCreate, *, retry_of: str | None = None) 
             if not PROMETHEUS_URL:
                 raise HTTPException(503, "Configure PROMETHEUS_URL to run a telemetry replay")
             if cfg["baseline_replicas"] is not None:
-                raise HTTPException(422, "baseline_replicas is available only in simulation")
+                raise HTTPException(422, "baseline_replicas is available for simulation and staging benchmarks")
             source = "PROMETHEUS"
         else:
             source = "SIMULATED_WORKLOAD"
             if cfg["baseline_replicas"] is None:
                 cfg["baseline_replicas"] = max(cfg["min_replicas"], min(2, cfg["max_replicas"]))
+        if mode == staging.MODE:
+            if live_target is None:
+                raise HTTPException(403, "Staging target authorization is required.")
+            if c.execute(
+                "SELECT 1 FROM staging_runs WHERE target_key=? AND restore_state='PENDING'", (live_target.key,),
+            ).fetchone():
+                raise HTTPException(409, "A live benchmark or restoration already owns this staging Deployment.")
+            source = staging.SOURCE
+            cfg["workload"] = "SPIKE"
+            cfg["staging"] = cfg["staging"] or StagingOptions().model_dump()
+            cfg["staging_target"] = asdict(live_target)
         if not c.execute("SELECT 1 FROM images WHERE image_ref=?", (cfg["image_ref"],)).fetchone():
             raise HTTPException(400, "Register the container image before creating an experiment")
         c.execute(
@@ -888,6 +1256,12 @@ def queue_experiment(payload: ExperimentCreate, *, retry_of: str | None = None) 
              cfg["duration_seconds"], cfg["min_replicas"], cfg["max_replicas"], cfg["target_cpu"], cfg["target_latency"],
              "QUEUED", source, now_iso(), json.dumps(cfg), retry_of, time.time() + EXPERIMENT_LEASE_SECONDS),
         )
+        if live_target is not None:
+            c.execute(
+                "INSERT INTO staging_runs(experiment_id,target_key,target_json,progress_json) VALUES(?,?,?,?)",
+                (experiment_id, live_target.key, json.dumps(cfg["staging_target"]),
+                 json.dumps({"phase": "QUEUED", "finished_trials": 0, "total_trials": len(cfg["strategies"]) + 1})),
+            )
     tasks = app.state.experiment_tasks
     task = asyncio.create_task(execute_experiment(experiment_id, cfg))
     tasks[experiment_id] = task
@@ -896,12 +1270,13 @@ def queue_experiment(payload: ExperimentCreate, *, retry_of: str | None = None) 
 
 
 @app.post("/api/v1/experiments", status_code=202, dependencies=[Depends(get_current_user)])
-async def create_experiment(payload: ExperimentCreate):
-    return queue_experiment(payload)
+async def create_experiment(payload: ExperimentCreate, staging_token: str | None = Header(default=None, alias="X-Staging-Token")):
+    target = authorize_staging(staging_token) if payload.mode == staging.MODE else None
+    return queue_experiment(payload, live_target=target)
 
 
 @app.post("/api/v1/experiments/{experiment_id}/retry", status_code=202, dependencies=[Depends(get_current_user)])
-async def retry_experiment(experiment_id: str):
+async def retry_experiment(experiment_id: str, staging_token: str | None = Header(default=None, alias="X-Staging-Token")):
     with db() as c:
         previous = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
     if previous is None:
@@ -917,7 +1292,12 @@ async def retry_experiment(experiment_id: str):
         config["max_replicas"] = max(config["max_replicas"], config["min_replicas"])
         config["strategies"] = previous["strategy"].split(",")
         config["mode"] = experiment_mode(previous["source"])
-    return queue_experiment(ExperimentCreate.model_validate(config), retry_of=experiment_id)
+    target = None
+    if previous["source"] == staging.SOURCE:
+        target = authorize_staging(staging_token)
+        if config.get("staging_target") != asdict(target):
+            raise HTTPException(409, "Retry requires the original staging target configuration.")
+    return queue_experiment(ExperimentCreate.model_validate(config), retry_of=experiment_id, live_target=target)
 
 
 @app.post("/api/v1/metrics/ingest", status_code=201, dependencies=[Depends(get_current_user)])
@@ -949,19 +1329,14 @@ def list_scaling_events(experiment_id: Optional[str] = None, limit: int = Query(
             rows = c.execute("SELECT * FROM scaling_events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return [rowdict(r) for r in rows]
 
-@app.get("/api/v1/experiments/{experiment_id}/compare")
-def compare_experiment(experiment_id: str):
-    with db() as c:
-        row = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
-    if row is None:
-        raise HTTPException(404, "Experiment not found")
+def comparison_report(row: sqlite3.Row, live: dict | None = None) -> dict:
     mode = experiment_mode(row["source"])
     report = {
-        "experiment_id": experiment_id, "status": row["status"], "source": row["source"], "mode": mode,
+        "experiment_id": row["id"], "status": row["status"], "source": row["source"], "mode": mode,
         "error": row["error"], "data_quality": experiment_data_quality(row),
         "score_formula": None, "strategies": [], "baseline": None,
     }
-    if row["status"] != "COMPLETED":
+    if row["status"] != "COMPLETED" and mode != staging.MODE:
         return report
     results, baseline = experiment_results(row)
     if mode == "SIMULATION":
@@ -971,9 +1346,77 @@ def compare_experiment(experiment_id: str):
         report["score_formula"] = SCORE_FORMULA
         if baseline is not None:
             report["baseline"] = {"strategy": "BASELINE", **baseline}
+    elif mode == staging.MODE:
+        eligibility = {True: 0, False: 1, None: 2}
+        report["strategies"] = sorted(
+            ({"strategy": name, **result} for name, result in results.items()),
+            key=lambda result: (eligibility[result["meets_targets"]], result["replica_minutes"]),
+        )
+        report["staging"] = live
+        if baseline is not None:
+            report["baseline"] = {"strategy": "BASELINE", **baseline}
+        report["recommended_strategies"] = []
+        if row["status"] == "COMPLETED":
+            all_trials = results if baseline is None else results | {"BASELINE": baseline}
+            eligible = {name: trial["replica_minutes"] for name, trial in all_trials.items() if trial["meets_targets"] is True}
+            if eligible:
+                best = min(eligible.values())
+                report["recommended_strategies"] = [name for name, usage in eligible.items() if usage == best]
     else:
         report["strategies"] = [{"strategy": name, **result} for name, result in results.items()]
     return report
+
+
+@app.get("/api/v1/experiments/{experiment_id}/compare")
+def compare_experiment(experiment_id: str):
+    with db() as c:
+        row = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Experiment not found")
+        live = staging_info(c, experiment_id) if row["source"] == staging.SOURCE else None
+    return comparison_report(row, live)
+
+
+@app.get("/api/v1/experiments/{experiment_id}/stream", dependencies=[Depends(get_current_user)])
+async def stream_staging_experiment(
+    experiment_id: str, request: Request, last_event_id: int = Header(default=0, alias="Last-Event-ID", ge=0),
+):
+    with db() as c:
+        run = c.execute("SELECT source FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+    if run is None:
+        raise HTTPException(404, "Experiment not found")
+    if run["source"] != staging.SOURCE:
+        raise HTTPException(409, "This stream is for live staging benchmarks.")
+
+    async def events():
+        cursor = last_event_id
+        previous = None
+        heartbeat = time.monotonic()
+        while not await request.is_disconnected():
+            with db() as c:
+                row = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+                live = staging_info(c, experiment_id)
+                samples = staging_samples(c, experiment_id, cursor, 100)
+            for sample in samples:
+                cursor = sample["id"]
+                yield f"id: {cursor}\nevent: sample\ndata: {json.dumps(sample)}\n\n"
+            report = comparison_report(row, live)
+            if report != previous:
+                yield f"event: report\ndata: {json.dumps(report)}\n\n"
+                previous = report
+            if len(samples) == 100:
+                continue
+            if row["status"] in {"COMPLETED", "FAILED", "INTERRUPTED"} and live["restoration"]["status"] != "PENDING":
+                return
+            if time.monotonic() - heartbeat >= 15:
+                yield ": heartbeat\n\n"
+                heartbeat = time.monotonic()
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
 
 @app.get("/api/v1/stream")
 async def stream():
