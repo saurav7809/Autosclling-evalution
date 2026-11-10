@@ -1,37 +1,50 @@
 from __future__ import annotations
 import asyncio, json, os, re, shutil, sqlite3, subprocess, time, uuid
-from contextlib import asynccontextmanager
+import logging
+import math
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 import psutil
 import docker
-from fastapi import FastAPI, HTTPException, Header, Query
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Query
 from prometheus_fastapi_instrumentator import Instrumentator
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field, field_validator, model_validator
 from jose import jwt as jose_jwt, JWTError
 from passlib.context import CryptContext
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "autoscaling.db"
 PROMETHEUS_URL = os.getenv("PROMETHEUS_URL", "").rstrip("/")
 STRATEGIES = ("CPU", "TREND", "LATENCY")
+REPLAY_METRICS = ("cpu_percent", "memory_percent", "p95_latency_ms", "request_rate")
+PROMETHEUS_TIMEOUT = 4.0
+MIN_REPLAY_COVERAGE = 0.8
+EXPERIMENT_LEASE_SECONDS = 45
+INTERRUPTED_MESSAGE = "The worker stopped before the experiment finished. Retry to start a new attempt."
+SCORE_FORMULA = "100 - 35*(avg_latency/latency_target) - 0.25*avg_cpu - 0.7*scaling_events; clamped 0..100"
+SPIKE_START, SPIKE_END = 0.25, 0.65
 
-JWT_SECRET = os.getenv("JWT_SECRET", "aegiscloud-dev-secret-change-in-prod")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_HOURS = 24
+bearer = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-import math as _math, threading as _threading
+import threading as _threading
 from collections import deque as _deque
 
 # Rolling metric history (updated by prometheus_scrape_loop, consumed by advisor)
-_metric_history: _deque = _deque(maxlen=15)  # ~75 s at 5 s interval
+_metric_history: _deque[float] = _deque(maxlen=15)  # ~75 s at 5 s interval
 _history_lock = _threading.Lock()
 
 # Advisor recommendation tracker for live scaling event emission
@@ -94,13 +107,15 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+@contextmanager
+def db() -> Iterator[sqlite3.Connection]:
+    with closing(sqlite3.connect(DB_PATH, check_same_thread=False)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        yield conn
 
 
 def init_db() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS images (
@@ -140,67 +155,151 @@ def init_db() -> None:
           role TEXT NOT NULL DEFAULT 'user'
         );
         """)
+        # Serialize schema inspection and upgrades across processes sharing the database.
+        c.execute("BEGIN IMMEDIATE")
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(experiments)")}
+        for column, kind in (
+            ("config_json", "TEXT"),
+            ("error", "TEXT"),
+            ("retry_of", "TEXT"),
+            ("lease_until", "REAL"),
+            ("data_quality_json", "TEXT"),
+        ):
+            if column not in columns:
+                c.execute(f"ALTER TABLE experiments ADD COLUMN {column} {kind}")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_experiments_retry_of ON experiments(retry_of)")
+
+
+class ExperimentInterrupted(RuntimeError):
+    pass
+
+
+def renew_experiment_lease(c: sqlite3.Connection, experiment_id: str) -> None:
+    now = time.time()
+    updated = c.execute(
+        "UPDATE experiments SET lease_until=? WHERE id=? AND status='RUNNING' AND lease_until>?",
+        (now + EXPERIMENT_LEASE_SECONDS, experiment_id, now),
+    )
+    if not updated.rowcount:
+        raise ExperimentInterrupted
+
+
+def end_failed_experiment(experiment_id: str, status: str, error: str, data_quality: dict | None = None) -> None:
+    with db() as c:
+        c.execute(
+            "UPDATE experiments SET status=?, completed_at=?, error=?, lease_until=NULL, data_quality_json=? "
+            "WHERE id=? AND status IN ('QUEUED','RUNNING')",
+            (status, now_iso(), error, json.dumps(data_quality) if data_quality is not None else None, experiment_id),
+        )
+
+
+def interrupt_expired_experiments() -> None:
+    with db() as c:
+        c.execute(
+            "UPDATE experiments SET status='INTERRUPTED', completed_at=?, error=?, lease_until=NULL "
+            "WHERE status IN ('QUEUED','RUNNING') AND (lease_until IS NULL OR lease_until<=?)",
+            (now_iso(), INTERRUPTED_MESSAGE, time.time()),
+        )
+
+
+async def watch_experiment_leases():
+    while True:
+        await asyncio.sleep(5)
+        try:
+            interrupt_expired_experiments()
+        except sqlite3.Error:
+            logger.exception("Could not check experiment leases")
+
+
+def prometheus_value(response: httpx.Response) -> float | None:
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("status") != "success":
+        return None
+    values = []
+    for item in payload.get("data", {}).get("result", []):
+        try:
+            value = float(item["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value >= 0:
+            values.append(value)
+    average = sum(values) / len(values) if values else None
+    return round(average, 3) if average is not None and math.isfinite(average) else None
+
+
+async def read_prometheus_metrics(client: httpx.AsyncClient, keys: tuple[str, ...]) -> dict[str, float | None]:
+    async def fetch(key: str) -> float | None:
+        try:
+            async with asyncio.timeout(PROMETHEUS_TIMEOUT):
+                response = await client.get(
+                    f"{PROMETHEUS_URL}/api/v1/query", params={"query": PROMETHEUS_QUERIES[key]},
+                )
+            return prometheus_value(response)
+        except (TimeoutError, httpx.HTTPError, ValueError, TypeError, AttributeError):
+            return None
+
+    return dict(zip(keys, await asyncio.gather(*(fetch(key) for key in keys))))
+
+
+def query_prometheus_metrics(keys: tuple[str, ...]) -> dict[str, float | None]:
+    values = {}
+    with httpx.Client(timeout=PROMETHEUS_TIMEOUT) as client:
+        for key in keys:
+            try:
+                response = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": PROMETHEUS_QUERIES[key]})
+                values[key] = prometheus_value(response)
+            except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+                values[key] = None
+    return values
 
 
 async def prometheus_scrape_loop():
-    """Background task: scrape Prometheus every 5 s and persist samples with source=PROMETHEUS."""
-    if not PROMETHEUS_URL:
-        return
-    import httpx
-    while True:
-        try:
-            values: dict = {}
-            with httpx.Client(timeout=4.0) as client:
-                for key, query in PROMETHEUS_QUERIES.items():
-                    try:
-                        r = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query})
-                        r.raise_for_status()
-                        result = r.json().get("data", {}).get("result", [])
-                        nums = [
-                            float(item["value"][1]) for item in result
-                            if len(item.get("value", [])) > 1
-                            and item["value"][1] not in ("NaN", "+Inf", "-Inf")
-                        ]
-                        values[key] = round(sum(nums) / len(nums), 3) if nums else None
-                    except Exception:
-                        values[key] = None
-            cpu  = values.get("cpu_percent")
-            mem  = values.get("memory_percent")
-            lat  = values.get("p95_latency_ms")
-            rate = values.get("request_rate")
-            reps = values.get("running_containers")
-            # Only persist when we have at least one real value
-            if cpu is not None or mem is not None:
-                # Feed rolling history for advisor TREND detection
-                with _history_lock:
-                    _metric_history.append({
-                        "cpu":     round(cpu  or 0.0, 2),
-                        "rate":    round(rate or 0.0, 4),
-                        "latency": round(lat  or 0.0, 2),
-                    })
-                with db() as c:
-                    c.execute(
-                        "INSERT INTO samples(experiment_id,timestamp,cpu_percent,memory_percent,"
-                        "latency_ms,request_rate,replicas,source,note) VALUES(?,?,?,?,?,?,?,?,?)",
-                        (None, now_iso(),
-                         round(cpu  or 0.0, 2),
-                         round(mem  or 0.0, 2),
-                         round(lat  or 0.0, 2),
-                         round(rate or 0.0, 4),
-                         int(reps   or 0),
-                         "PROMETHEUS",
-                         "Live Prometheus scrape"))
-        except Exception:
-            pass
-        await asyncio.sleep(5)
+    """Record complete observations and reset trend history across missing windows."""
+    async with httpx.AsyncClient(timeout=PROMETHEUS_TIMEOUT) as client:
+        while True:
+            values = await read_prometheus_metrics(client, (*REPLAY_METRICS, "running_containers"))
+            cpu, memory, latency, rate = (values[key] for key in REPLAY_METRICS)
+            replicas = values["running_containers"]
+            with _history_lock:
+                if rate is None:
+                    _metric_history.clear()
+                else:
+                    _metric_history.append(rate)
+            if None not in (cpu, memory, latency, rate, replicas):
+                try:
+                    with db() as c:
+                        c.execute(
+                            "INSERT INTO samples(experiment_id,timestamp,cpu_percent,memory_percent,"
+                            "latency_ms,request_rate,replicas,source,note) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (None, now_iso(), cpu, memory, latency, rate, int(replicas),
+                             "PROMETHEUS", "Live Prometheus scrape"),
+                        )
+                except sqlite3.Error:
+                    logger.exception("Could not record the Prometheus sample")
+            await asyncio.sleep(5)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if len(JWT_SECRET.encode("utf-8")) < 32:
+        raise RuntimeError("Set JWT_SECRET to a random secret of at least 32 bytes.")
     init_db()
+    interrupt_expired_experiments()
+    app.state.experiment_tasks = {}
+    background = [asyncio.create_task(watch_experiment_leases())]
     if PROMETHEUS_URL:
-        asyncio.create_task(prometheus_scrape_loop())
-    yield
+        background.append(asyncio.create_task(prometheus_scrape_loop()))
+    try:
+        yield
+    finally:
+        runs = app.state.experiment_tasks.copy()
+        tasks = [*background, *runs.values()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for experiment_id in runs:
+            end_failed_experiment(experiment_id, "INTERRUPTED", INTERRUPTED_MESSAGE)
 
 app = FastAPI(title="Cloud-Agnostic Auto-Scaling Evaluation API", version="1.0.0",
               description="Register container image references, evaluate scaling policies, inspect telemetry and compare experiments.",
@@ -224,7 +323,9 @@ class ImageRegistration(BaseModel):
 class ExperimentCreate(BaseModel):
     name: str = Field(min_length=3, max_length=100)
     image_ref: str = Field(min_length=3, max_length=255)
-    strategies: list[Literal["CPU", "TREND", "LATENCY"]] = ["CPU", "TREND", "LATENCY"]
+    strategies: list[Literal["CPU", "TREND", "LATENCY"]] = Field(
+        default=["CPU", "TREND", "LATENCY"], min_length=1,
+    )
     workload: Literal["RAMP", "SPIKE", "STEADY", "WAVE"] = "RAMP"
     duration_seconds: int = Field(default=60, ge=15, le=3600)
     min_replicas: int = Field(default=1, ge=1, le=100)
@@ -232,14 +333,16 @@ class ExperimentCreate(BaseModel):
     target_cpu: float = Field(default=65, ge=10, le=95)
     target_latency: float = Field(default=250, ge=10, le=10000)
     sample_interval_seconds: int = Field(default=2, ge=1, le=10)
+    mode: Literal["SIMULATION", "TELEMETRY_REPLAY"] | None = None
+    baseline_replicas: int | None = Field(default=None, ge=1, le=100)
 
-    @field_validator("max_replicas")
-    @classmethod
-    def max_gte_min(cls, v, info):
-        mn = info.data.get("min_replicas", 1)
-        if v < mn:
+    @model_validator(mode="after")
+    def validate_replica_bounds(self) -> ExperimentCreate:
+        if self.max_replicas < self.min_replicas:
             raise ValueError("max_replicas must be >= min_replicas")
-        return v
+        if self.baseline_replicas is not None and not self.min_replicas <= self.baseline_replicas <= self.max_replicas:
+            raise ValueError("baseline_replicas must be between min_replicas and max_replicas")
+        return self
 
 class MetricIngest(BaseModel):
     experiment_id: Optional[str] = None
@@ -271,21 +374,21 @@ def _create_jwt(user_id: str, username: str, role: str) -> str:
     return jose_jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-def get_current_user(authorization: str = Header(None)) -> dict:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
-    token = authorization.removeprefix("Bearer ").strip()
+def get_current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+    unauthorized = {"status_code": 401, "headers": {"WWW-Authenticate": "Bearer"}}
+    if credentials is None:
+        raise HTTPException(detail="Bearer token required", **unauthorized)
     try:
-        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        user_id = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        payload = jose_jwt.decode(
+            credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+            options={"require_exp": True, "require_sub": True},
+        )
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(detail="Invalid or expired token", **unauthorized) from None
     with db() as c:
-        user = c.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        user = c.execute("SELECT * FROM users WHERE id=?", (payload["sub"],)).fetchone()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(detail="User not found", **unauthorized)
     return rowdict(user)
 
 
@@ -348,8 +451,7 @@ def auth_login(payload: UserLogin):
 
 
 @app.get("/api/v1/auth/me")
-def auth_me(authorization: str = Header(None)):
-    user = get_current_user(authorization)
+def auth_me(user: dict = Depends(get_current_user)):
     user.pop("password_hash", None)
     return user
 
@@ -377,7 +479,7 @@ def list_images():
     with db() as c:
         return [rowdict(r) for r in c.execute("SELECT * FROM images ORDER BY created_at DESC").fetchall()]
 
-@app.post("/api/v1/images", status_code=201)
+@app.post("/api/v1/images", status_code=201, dependencies=[Depends(get_current_user)])
 def register_image(payload: ImageRegistration):
     image_ref = payload.image_ref
     repository, tag = split_image(image_ref)
@@ -392,7 +494,7 @@ def register_image(payload: ImageRegistration):
                   (image_id, image_ref, display, repository.split("/")[0] if "/" in repository else "docker.io", tag, digest, payload.source, now_iso(), "REGISTERED"))
         return rowdict(c.execute("SELECT * FROM images WHERE id=?", (image_id,)).fetchone())
 
-@app.post("/api/v1/images/discover-docker")
+@app.post("/api/v1/images/discover-docker", dependencies=[Depends(get_current_user)])
 def discover_docker_images():
     try:
         client = docker.DockerClient(
@@ -427,26 +529,57 @@ def discover_docker_images():
             detail=f"Cannot connect to Docker Engine: {exc}",
         )
 
-@app.delete("/api/v1/images/{image_id}", status_code=204)
+@app.delete("/api/v1/images/{image_id}", status_code=204, dependencies=[Depends(get_current_user)])
 def delete_image(image_id: str):
     with db() as c:
         cur = c.execute("DELETE FROM images WHERE id=?", (image_id,))
         if not cur.rowcount:
             raise HTTPException(404, "Image registration not found")
 
+def experiment_mode(source: str) -> str:
+    return "TELEMETRY_REPLAY" if source == "PROMETHEUS" else "SIMULATION"
+
+
+def experiment_data_quality(row: sqlite3.Row) -> dict | None:
+    if row["data_quality_json"] is not None:
+        return json.loads(row["data_quality_json"])
+    if row["source"] == "PROMETHEUS" and row["status"] == "COMPLETED":
+        return {"status": "UNVERIFIED"}
+    return None
+
+
+def experiment_results(row: sqlite3.Row) -> tuple[dict, dict | None]:
+    results = json.loads(row["results_json"]) if row["results_json"] else {}
+    baseline = results.pop("BASELINE", None)
+    if row["source"] == "PROMETHEUS":
+        for result in results.values():
+            result["evaluation_score"] = None
+    return results, baseline
+
+
+def experiment_response(row: sqlite3.Row, *, include_config: bool = False) -> dict:
+    item = dict(row)
+    config_json = item.pop("config_json")
+    item.pop("lease_until")
+    item.pop("data_quality_json")
+    item.pop("results_json")
+    item["mode"] = experiment_mode(row["source"])
+    item["data_quality"] = experiment_data_quality(row)
+    results, baseline = experiment_results(row)
+    if results or include_config:
+        item["results"] = results or None
+    if baseline is not None:
+        item["baseline"] = baseline
+    if include_config:
+        item["config"] = json.loads(config_json) if config_json else None
+    return item
+
+
 @app.get("/api/v1/experiments")
 def list_experiments():
     with db() as c:
-        rows = c.execute("SELECT id,name,image_ref,strategy,workload,duration_seconds,min_replicas,max_replicas,target_cpu,target_latency,status,source,created_at,completed_at,results_json FROM experiments ORDER BY created_at DESC").fetchall()
-    result = []
-    for r in rows:
-        item = rowdict(r)
-        if item.get("results_json"):
-            item["results"] = json.loads(item.pop("results_json"))
-        else:
-            item.pop("results_json", None)
-        result.append(item)
-    return result
+        rows = c.execute("SELECT * FROM experiments ORDER BY created_at DESC").fetchall()
+    return [experiment_response(row) for row in rows]
 
 @app.get("/api/v1/experiments/{experiment_id}")
 def get_experiment(experiment_id: str):
@@ -455,9 +588,7 @@ def get_experiment(experiment_id: str):
         if not exp: raise HTTPException(404, "Experiment not found")
         samples = c.execute("SELECT * FROM samples WHERE experiment_id=? ORDER BY id", (experiment_id,)).fetchall()
         events = c.execute("SELECT * FROM scaling_events WHERE experiment_id=? ORDER BY id", (experiment_id,)).fetchall()
-    item = rowdict(exp)
-    item["results"] = json.loads(item["results_json"]) if item["results_json"] else None
-    item.pop("results_json", None)
+    item = experiment_response(exp, include_config=True)
     item["samples"] = [rowdict(x) for x in samples]
     item["scaling_events"] = [rowdict(x) for x in events]
     return item
@@ -465,8 +596,8 @@ def get_experiment(experiment_id: str):
 
 def workload_rate(kind: str, pct: float) -> float:
     if kind == "STEADY": return 80
-    if kind == "SPIKE": return 35 if pct < .25 else (220 if pct < .65 else 55)
-    if kind == "WAVE": return 45 + 125 * (0.5 + 0.5 * __import__('math').sin(pct * 6.283 * 2))
+    if kind == "SPIKE": return 35 if pct < SPIKE_START else (220 if pct < SPIKE_END else 55)
+    if kind == "WAVE": return 45 + 125 * (0.5 + 0.5 * math.sin(pct * 6.283 * 2))
     return 25 + 175 * pct
 
 
@@ -488,180 +619,308 @@ def choose_replicas(strategy: str, cpu: float, latency: float, rates: list[float
         reason = f"Latency {latency:.1f} ms versus target {target_latency:.1f} ms"
     return max(mn, min(mx, desired)), reason
 
-async def run_experiment(experiment_id: str, config: dict):
-    """Simulated controlled workload: clearly marked, not a real cloud cluster."""
-    with db() as c:
-        c.execute("UPDATE experiments SET status='RUNNING' WHERE id=?", (experiment_id,))
-    all_result = {}
-    start = time.monotonic()
-    for strategy in config["strategies"]:
-        replica = config["min_replicas"]
-        rates: list[float] = []
-        cpu_vals, mem_vals, lat_vals, rep_vals = [], [], [], []
-        previous = replica
-        duration = config["duration_seconds"]
-        interval = config["sample_interval_seconds"]
-        steps = max(5, min(180, duration // interval))
-        for step in range(steps):
-            pct = step / max(steps - 1, 1)
-            rate = workload_rate(config["workload"], pct)
-            # Controlled model: demand per replica drives pressure; deterministic jitter preserves reproducibility.
-            import math
-            jitter = 3 * math.sin(step * 1.71 + len(strategy))
-            cpu = max(4, min(100, rate * 0.72 / max(replica, 1) + jitter + 8))
-            latency = max(15, (26 + rate * 1.20 / max(replica, 1) + max(0, cpu - 60) * 6 + (20 if config["workload"] == "SPIKE" and .25 < pct < .65 else 0)))
-            memory = max(12, min(96, 24 + replica * 5 + rate * .05))
-            desired, reason = choose_replicas(strategy, cpu, latency, rates, replica,
-                                               config["min_replicas"], config["max_replicas"],
-                                               config["target_cpu"], config["target_latency"])
-            scaling = None
-            if desired != replica:
-                scaling = "SCALE_UP" if desired > replica else "SCALE_DOWN"
-                with db() as c:
-                    c.execute("INSERT INTO scaling_events(experiment_id,timestamp,strategy,previous_replicas,desired_replicas,reason,source) VALUES(?,?,?,?,?,?,?)",
-                              (experiment_id, now_iso(), strategy, replica, desired, reason, "SIMULATED_WORKLOAD"))
-                replica = desired
-            sample = (experiment_id, now_iso(), round(cpu, 2), round(memory, 2), round(latency, 2), round(rate, 2), replica, scaling, "SIMULATED_WORKLOAD", f"{strategy} policy; controlled workload")
-            with db() as c:
-                c.execute("INSERT INTO samples(experiment_id,timestamp,cpu_percent,memory_percent,latency_ms,request_rate,replicas,scaling_event,source,note) VALUES(?,?,?,?,?,?,?,?,?,?)", sample)
-            cpu_vals.append(cpu); mem_vals.append(memory); lat_vals.append(latency); rep_vals.append(replica); rates.append(rate)
-            # The evaluation runs fast for a presentation; metric timestamps still reflect each actual sample.
-            await asyncio.sleep(min(0.05, interval / 100))
-        all_result[strategy] = {
-            "samples": len(cpu_vals), "avg_cpu_percent": round(sum(cpu_vals)/len(cpu_vals),2),
-            "avg_memory_percent": round(sum(mem_vals)/len(mem_vals),2),
-            "avg_latency_ms": round(sum(lat_vals)/len(lat_vals),2),
-            "p95_latency_ms": round(sorted(lat_vals)[min(len(lat_vals)-1, int(len(lat_vals)*.95))],2),
-            "avg_replicas": round(sum(rep_vals)/len(rep_vals),2),
-            "max_replicas_used": max(rep_vals), "scaling_events": sum(1 for a,b in zip(rep_vals, rep_vals[1:]) if a != b),
-            "target_latency_ms": config["target_latency"], "source": "SIMULATED_WORKLOAD"
-        }
-        # Store the same transparent comparison heuristic exposed by the comparison endpoint,
-        # so the list/detail UI can render scores without calculating or guessing them client-side.
-        row = all_result[strategy]
-        row["evaluation_score"] = round(max(0, min(100, 100 -
-            row["avg_latency_ms"] / max(row["target_latency_ms"], 1) * 35 -
-            row["avg_cpu_percent"] * 0.25 - row["scaling_events"] * 0.7)), 2)
-    with db() as c:
-        c.execute("UPDATE experiments SET status='COMPLETED', completed_at=?, results_json=? WHERE id=?",
-                  (now_iso(), json.dumps(all_result), experiment_id))
+class Observation(NamedTuple):
+    timestamp: str
+    cpu: float
+    memory: float
+    latency: float
+    rate: float
 
-async def run_experiment_real(experiment_id: str, config: dict):
-    """Live experiment: polls Prometheus for real metrics, then replays each strategy
-    against the identical observation sequence so comparisons are fair."""
-    import httpx
-    with db() as c:
-        c.execute("UPDATE experiments SET status='RUNNING' WHERE id=?", (experiment_id,))
 
+def sampling_plan(config: dict) -> tuple[int, float]:
     duration = config["duration_seconds"]
-    interval = config["sample_interval_seconds"]
-    steps = max(5, min(180, duration // interval))
+    steps = max(5, min(180, duration // config["sample_interval_seconds"]))
+    return steps, duration / steps
 
-    # ── Phase 1: collect real Prometheus snapshots ──────────────────────────
-    snapshots: list[dict] = []
-    for _ in range(steps):
-        snap: dict = {"timestamp": now_iso(), "cpu": 0.0, "memory": 0.0,
-                      "latency": 0.0, "rate": 0.0, "containers": 0}
-        try:
-            with httpx.Client(timeout=3.0) as client:
-                for key, query in PROMETHEUS_QUERIES.items():
-                    try:
-                        r = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query})
-                        r.raise_for_status()
-                        result = r.json().get("data", {}).get("result", [])
-                        nums = [float(item["value"][1]) for item in result
-                                if len(item.get("value", [])) > 1
-                                and item["value"][1] not in ("NaN", "+Inf", "-Inf")]
-                        val = round(sum(nums) / len(nums), 3) if nums else None
-                        if   key == "cpu_percent":        snap["cpu"]        = round(val or 0.0, 2)
-                        elif key == "memory_percent":     snap["memory"]     = round(val or 0.0, 2)
-                        elif key == "p95_latency_ms":     snap["latency"]    = round(val or 0.0, 2)
-                        elif key == "request_rate":       snap["rate"]       = round(val or 0.0, 4)
-                        elif key == "running_containers": snap["containers"] = int(val or 0)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        snapshots.append(snap)
-        await asyncio.sleep(interval)
 
-    # ── Phase 2: replay each strategy against the same observations ──────────
-    all_result: dict = {}
-    for strategy in config["strategies"]:
-        replica = config["min_replicas"]
-        rates: list[float] = []
-        cpu_vals, mem_vals, lat_vals, rep_vals = [], [], [], []
-        for snap in snapshots:
-            cpu, memory, latency, rate = snap["cpu"], snap["memory"], snap["latency"], snap["rate"]
+def record_experiment_sample(
+    experiment_id: str, strategy: str, observation: Observation,
+    current: int, desired: int, reason: str, source: str,
+) -> bool:
+    scaling = None
+    simulated = source == "SIMULATED_WORKLOAD"
+    with db() as c:
+        renew_experiment_lease(c, experiment_id)
+        if desired != current:
+            scaling = "SCALE_UP" if desired > current else "SCALE_DOWN"
+            c.execute(
+                "INSERT INTO scaling_events(experiment_id,timestamp,strategy,previous_replicas,"
+                "desired_replicas,reason,source) VALUES(?,?,?,?,?,?,?)",
+                (experiment_id, observation.timestamp, strategy, current, desired, reason, source),
+            )
+        note = "simulated workload" if simulated else "Prometheus trace replay"
+        c.execute(
+            "INSERT INTO samples(experiment_id,timestamp,cpu_percent,memory_percent,latency_ms,"
+            "request_rate,replicas,scaling_event,source,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (experiment_id, *observation, current if simulated else desired, scaling, source, f"{strategy} policy; {note}"),
+        )
+    return scaling is not None
+
+
+def summarize_strategy(
+    samples: list[tuple[Observation, int]], scaling_events: int, target_latency: float, source: str,
+) -> dict:
+    count = len(samples)
+    latencies = sorted(observation.latency for observation, _ in samples)
+    return {
+        "samples": count,
+        "avg_cpu_percent": round(sum(observation.cpu for observation, _ in samples) / count, 2),
+        "avg_memory_percent": round(sum(observation.memory for observation, _ in samples) / count, 2),
+        "avg_latency_ms": round(sum(latencies) / count, 2),
+        "p95_latency_ms": round(latencies[math.ceil(count * 0.95) - 1], 2),
+        "avg_replicas": round(sum(replicas for _, replicas in samples) / count, 2),
+        "max_replicas_used": max(replicas for _, replicas in samples),
+        "scaling_events": scaling_events,
+        "target_latency_ms": target_latency,
+        "source": source,
+    }
+
+
+def simulation_score(result: dict) -> float:
+    penalty = (
+        35 * result["avg_latency_ms"] / result["target_latency_ms"]
+        + 0.25 * result["avg_cpu_percent"]
+        + 0.7 * result["scaling_events"]
+    )
+    return round(max(0, min(100, 100 - penalty)), 2)
+
+
+def spike_recovery_seconds(latencies: list[float], target: float, step_seconds: float) -> float | None:
+    windows = len(latencies)
+    breach = next((
+        index for index, latency in enumerate(latencies)
+        if SPIKE_START <= index / windows < SPIKE_END and latency > target
+    ), None)
+    if breach is None:
+        return 0.0
+    recovery = next((index for index in range(breach + 1, windows) if latencies[index] <= target), None)
+    return round((recovery - breach) * step_seconds, 3) if recovery is not None else None
+
+
+async def run_experiment(experiment_id: str, config: dict) -> dict:
+    source = "SIMULATED_WORKLOAD"
+    steps, step_seconds = sampling_plan(config)
+    target = config["target_latency"]
+    results = {}
+    for strategy in (*config["strategies"], "BASELINE"):
+        fixed = strategy == "BASELINE"
+        replicas = config["baseline_replicas"] if fixed else config["min_replicas"]
+        rates, samples = [], []
+        scaling_events = 0
+        for step in range(steps):
+            phase = step / steps
+            rate = workload_rate(config["workload"], phase)
             rates.append(rate)
-            desired, reason = choose_replicas(
-                strategy, cpu, latency, rates, replica,
-                config["min_replicas"], config["max_replicas"],
-                config["target_cpu"], config["target_latency"])
-            scaling = None
-            if desired != replica:
-                scaling = "SCALE_UP" if desired > replica else "SCALE_DOWN"
-                with db() as c:
-                    c.execute("INSERT INTO scaling_events(experiment_id,timestamp,strategy,"
-                              "previous_replicas,desired_replicas,reason,source) VALUES(?,?,?,?,?,?,?)",
-                              (experiment_id, snap["timestamp"], strategy, replica, desired, reason, "PROMETHEUS"))
-                replica = desired
+            jitter = 3 * math.sin(step * 1.71)
+            cpu = max(4, min(100, rate * 0.72 / replicas + jitter + 8))
+            memory = max(12, min(96, 24 + replicas * 5 + rate * 0.05))
+            latency = 26 + rate * 1.20 / replicas + max(0, cpu - 60) * 6
+            if config["workload"] == "SPIKE" and SPIKE_START <= phase < SPIKE_END:
+                latency += 20
+            observation = Observation(now_iso(), round(cpu, 2), round(memory, 2), round(latency, 2), round(rate, 2))
+            if fixed:
+                desired, reason = replicas, "Fixed replica baseline"
+            else:
+                desired, reason = choose_replicas(
+                    strategy, observation.cpu, observation.latency, rates, replicas,
+                    config["min_replicas"], config["max_replicas"], config["target_cpu"], target,
+                )
+            scaling_events += record_experiment_sample(
+                experiment_id, strategy, observation, replicas, desired, reason, source,
+            )
+            samples.append((observation, replicas))
+            replicas = desired
+            await asyncio.sleep(min(0.05, step_seconds / 100))
+
+        result = summarize_strategy(samples, scaling_events, target, source)
+        latencies = [observation.latency for observation, _ in samples]
+        result["seconds_above_latency_target"] = round(sum(latency > target for latency in latencies) * step_seconds, 3)
+        result["replica_minutes"] = round(sum(count for _, count in samples) * step_seconds / 60, 3)
+        result["spike_recovery_seconds"] = (
+            spike_recovery_seconds(latencies, target, step_seconds) if config["workload"] == "SPIKE" else None
+        )
+        result["evaluation_score"] = simulation_score(result)
+        if fixed:
+            result["fixed_replicas"] = config["baseline_replicas"]
+        results[strategy] = result
+    return results
+
+
+async def collect_replay_trace(experiment_id: str, config: dict) -> tuple[list[Observation | None], dict]:
+    steps, step_seconds = sampling_plan(config)
+    observations = []
+    missing_by_metric = dict.fromkeys(REPLAY_METRICS, 0)
+    clock = asyncio.get_running_loop()
+    started = clock.time()
+    async with httpx.AsyncClient(timeout=PROMETHEUS_TIMEOUT) as client:
+        for step in range(steps):
+            if step:
+                await asyncio.sleep(max(0, started + step * step_seconds - clock.time()))
             with db() as c:
-                c.execute("INSERT INTO samples(experiment_id,timestamp,cpu_percent,memory_percent,"
-                          "latency_ms,request_rate,replicas,scaling_event,source,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                          (experiment_id, snap["timestamp"], cpu, memory, latency, rate,
-                           replica, scaling, "PROMETHEUS", f"{strategy} policy; live Prometheus observation"))
-            cpu_vals.append(cpu); mem_vals.append(memory); lat_vals.append(latency); rep_vals.append(replica)
+                renew_experiment_lease(c, experiment_id)
+            values = await read_prometheus_metrics(client, REPLAY_METRICS)
+            missing = [key for key in REPLAY_METRICS if values[key] is None]
+            for key in missing:
+                missing_by_metric[key] += 1
+            if missing:
+                observations.append(None)
+            else:
+                observations.append(Observation(now_iso(), *(values[key] for key in REPLAY_METRICS)))
+    valid = sum(observation is not None for observation in observations)
+    coverage = valid / steps
+    status = "INSUFFICIENT" if coverage < MIN_REPLAY_COVERAGE else "PARTIAL" if valid < steps else "COMPLETE"
+    return observations, {
+        "status": status, "attempted_windows": steps, "valid_windows": valid,
+        "coverage": round(coverage, 4), "minimum_coverage": MIN_REPLAY_COVERAGE,
+        "missing_by_metric": missing_by_metric,
+    }
 
-        if cpu_vals:
-            all_result[strategy] = {
-                "samples": len(cpu_vals),
-                "avg_cpu_percent":    round(sum(cpu_vals) / len(cpu_vals), 2),
-                "avg_memory_percent": round(sum(mem_vals) / len(mem_vals), 2),
-                "avg_latency_ms":     round(sum(lat_vals) / len(lat_vals), 2),
-                "p95_latency_ms":     round(sorted(lat_vals)[min(len(lat_vals) - 1, int(len(lat_vals) * .95))], 2),
-                "avg_replicas":       round(sum(rep_vals) / len(rep_vals), 2),
-                "max_replicas_used":  max(rep_vals),
-                "scaling_events":     sum(1 for a, b in zip(rep_vals, rep_vals[1:]) if a != b),
-                "target_latency_ms":  config["target_latency"],
-                "source": "PROMETHEUS",
-            }
-            row = all_result[strategy]
-            row["evaluation_score"] = round(max(0, min(100, 100 -
-                row["avg_latency_ms"] / max(row["target_latency_ms"], 1) * 35 -
-                row["avg_cpu_percent"] * 0.25 - row["scaling_events"] * 0.7)), 2)
 
+async def run_experiment_real(experiment_id: str, config: dict) -> tuple[dict | None, dict]:
+    """Replay each policy against the same observations and record its recommendations."""
+    observations, quality = await collect_replay_trace(experiment_id, config)
+    if quality["status"] == "INSUFFICIENT":
+        return None, quality
+    source = "PROMETHEUS"
+    results = {}
+    for strategy in config["strategies"]:
+        replicas = config["min_replicas"]
+        rates, samples = [], []
+        scaling_events = 0
+        for observation in observations:
+            if observation is None:
+                rates.clear()
+                continue
+            rates.append(observation.rate)
+            desired, reason = choose_replicas(
+                strategy, observation.cpu, observation.latency, rates, replicas,
+                config["min_replicas"], config["max_replicas"], config["target_cpu"], config["target_latency"],
+            )
+            scaling_events += record_experiment_sample(
+                experiment_id, strategy, observation, replicas, desired, reason, source,
+            )
+            replicas = desired
+            samples.append((observation, replicas))
+            await asyncio.sleep(0)
+        results[strategy] = summarize_strategy(samples, scaling_events, config["target_latency"], source)
+    return results, quality
+
+
+async def execute_experiment(experiment_id: str, config: dict) -> None:
+    try:
+        now = time.time()
+        with db() as c:
+            claimed = c.execute(
+                "UPDATE experiments SET status='RUNNING', lease_until=? "
+                "WHERE id=? AND status='QUEUED' AND lease_until>?",
+                (now + EXPERIMENT_LEASE_SECONDS, experiment_id, now),
+            ).rowcount
+        if not claimed:
+            return
+        quality = None
+        if config["mode"] == "TELEMETRY_REPLAY":
+            results, quality = await run_experiment_real(experiment_id, config)
+            if results is None:
+                error = (
+                    f"Prometheus returned {quality['valid_windows']} of {quality['attempted_windows']} complete "
+                    f"windows. Replay requires {MIN_REPLAY_COVERAGE:.0%} coverage."
+                )
+                end_failed_experiment(experiment_id, "FAILED", error, quality)
+                return
+        else:
+            results = await run_experiment(experiment_id, config)
+        with db() as c:
+            renew_experiment_lease(c, experiment_id)
+            c.execute(
+                "UPDATE experiments SET status='COMPLETED', completed_at=?, results_json=?, "
+                "lease_until=NULL, data_quality_json=? WHERE id=?",
+                (now_iso(), json.dumps(results), json.dumps(quality) if quality is not None else None, experiment_id),
+            )
+    except asyncio.CancelledError:
+        end_failed_experiment(experiment_id, "INTERRUPTED", INTERRUPTED_MESSAGE)
+        raise
+    except ExperimentInterrupted:
+        end_failed_experiment(experiment_id, "INTERRUPTED", INTERRUPTED_MESSAGE)
+    except Exception:
+        logger.exception("Experiment %s failed", experiment_id)
+        end_failed_experiment(experiment_id, "FAILED", "The experiment failed. Check server logs before retrying.")
+
+
+def experiment_receipt(experiment_id: str, status: str, source: str, retry_of: str | None) -> dict:
+    mode = experiment_mode(source)
+    message = (
+        "This run collects Prometheus observations and then replays each policy against the shared trace."
+        if mode == "TELEMETRY_REPLAY" else
+        "This run compares simulated scaling policies with a fixed replica baseline."
+    )
+    return {"id": experiment_id, "status": status, "source": source, "mode": mode, "message": message, "retry_of": retry_of}
+
+
+def queue_experiment(payload: ExperimentCreate, *, retry_of: str | None = None) -> dict:
+    cfg = payload.model_dump()
+    cfg["strategies"] = list(dict.fromkeys(cfg["strategies"]))
+    mode = cfg["mode"] or ("TELEMETRY_REPLAY" if PROMETHEUS_URL else "SIMULATION")
+    cfg["mode"] = mode
+    experiment_id = str(uuid.uuid4())
     with db() as c:
-        c.execute("UPDATE experiments SET status='COMPLETED', completed_at=?, results_json=? WHERE id=?",
-                  (now_iso(), json.dumps(all_result), experiment_id))
-
-
-@app.post("/api/v1/experiments", status_code=202)
-async def create_experiment(payload: ExperimentCreate):
-    if not payload.strategies:
-        raise HTTPException(422, "Select at least one scaling strategy")
-    src = "PROMETHEUS" if PROMETHEUS_URL else "SIMULATED_WORKLOAD"
-    with db() as c:
-        registered = c.execute("SELECT id FROM images WHERE image_ref=?", (payload.image_ref,)).fetchone()
-        if not registered:
+        c.execute("BEGIN IMMEDIATE")
+        if retry_of is not None:
+            retry = c.execute("SELECT id,status,source FROM experiments WHERE retry_of=?", (retry_of,)).fetchone()
+            if retry is not None:
+                return experiment_receipt(retry["id"], retry["status"], retry["source"], retry_of)
+        if mode == "TELEMETRY_REPLAY":
+            if not PROMETHEUS_URL:
+                raise HTTPException(503, "Configure PROMETHEUS_URL to run a telemetry replay")
+            if cfg["baseline_replicas"] is not None:
+                raise HTTPException(422, "baseline_replicas is available only in simulation")
+            source = "PROMETHEUS"
+        else:
+            source = "SIMULATED_WORKLOAD"
+            if cfg["baseline_replicas"] is None:
+                cfg["baseline_replicas"] = max(cfg["min_replicas"], min(2, cfg["max_replicas"]))
+        if not c.execute("SELECT 1 FROM images WHERE image_ref=?", (cfg["image_ref"],)).fetchone():
             raise HTTPException(400, "Register the container image before creating an experiment")
-        eid = str(uuid.uuid4())
-        cfg = payload.model_dump()
-        base_strategy = ",".join(cfg["strategies"])
-        c.execute("INSERT INTO experiments(id,name,image_ref,strategy,workload,duration_seconds,min_replicas,max_replicas,target_cpu,target_latency,status,source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                  (eid, cfg["name"], cfg["image_ref"], base_strategy, cfg["workload"], cfg["duration_seconds"],
-                   cfg["min_replicas"], cfg["max_replicas"], cfg["target_cpu"], cfg["target_latency"],
-                   "QUEUED", src, now_iso()))
-    if PROMETHEUS_URL:
-        asyncio.create_task(run_experiment_real(eid, cfg))
-    else:
-        asyncio.create_task(run_experiment(eid, cfg))
-    msg = ("Experiment queued using live Prometheus metrics. Samples will stream in real time."
-           if PROMETHEUS_URL else
-           "Experiment queued. Samples and strategy results will appear as they are collected.")
-    return {"id": eid, "status": "QUEUED", "source": src, "message": msg}
+        c.execute(
+            "INSERT INTO experiments(id,name,image_ref,strategy,workload,duration_seconds,min_replicas,max_replicas,"
+            "target_cpu,target_latency,status,source,created_at,config_json,retry_of,lease_until) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (experiment_id, cfg["name"], cfg["image_ref"], ",".join(cfg["strategies"]), cfg["workload"],
+             cfg["duration_seconds"], cfg["min_replicas"], cfg["max_replicas"], cfg["target_cpu"], cfg["target_latency"],
+             "QUEUED", source, now_iso(), json.dumps(cfg), retry_of, time.time() + EXPERIMENT_LEASE_SECONDS),
+        )
+    tasks = app.state.experiment_tasks
+    task = asyncio.create_task(execute_experiment(experiment_id, cfg))
+    tasks[experiment_id] = task
+    task.add_done_callback(lambda _: tasks.pop(experiment_id, None))
+    return experiment_receipt(experiment_id, "QUEUED", source, retry_of)
 
-@app.post("/api/v1/metrics/ingest", status_code=201)
+
+@app.post("/api/v1/experiments", status_code=202, dependencies=[Depends(get_current_user)])
+async def create_experiment(payload: ExperimentCreate):
+    return queue_experiment(payload)
+
+
+@app.post("/api/v1/experiments/{experiment_id}/retry", status_code=202, dependencies=[Depends(get_current_user)])
+async def retry_experiment(experiment_id: str):
+    with db() as c:
+        previous = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+    if previous is None:
+        raise HTTPException(404, "Experiment not found")
+    if previous["status"] not in ("FAILED", "INTERRUPTED"):
+        raise HTTPException(409, "Only failed or interrupted experiments can be retried")
+    if previous["config_json"] is not None:
+        config = json.loads(previous["config_json"])
+    else:
+        config = {key: previous[key] for key in (
+            "name", "image_ref", "workload", "duration_seconds", "min_replicas", "max_replicas", "target_cpu", "target_latency",
+        )}
+        config["max_replicas"] = max(config["max_replicas"], config["min_replicas"])
+        config["strategies"] = previous["strategy"].split(",")
+        config["mode"] = experiment_mode(previous["source"])
+    return queue_experiment(ExperimentCreate.model_validate(config), retry_of=experiment_id)
+
+
+@app.post("/api/v1/metrics/ingest", status_code=201, dependencies=[Depends(get_current_user)])
 def ingest_metric(payload: MetricIngest):
     if payload.experiment_id:
         with db() as c:
@@ -693,16 +952,28 @@ def list_scaling_events(experiment_id: Optional[str] = None, limit: int = Query(
 @app.get("/api/v1/experiments/{experiment_id}/compare")
 def compare_experiment(experiment_id: str):
     with db() as c:
-        row = c.execute("SELECT results_json,status FROM experiments WHERE id=?", (experiment_id,)).fetchone()
-    if not row: raise HTTPException(404, "Experiment not found")
-    if row["status"] != "COMPLETED": return {"status": row["status"], "strategies": []}
-    results = json.loads(row["results_json"])
-    def score(x):
-        # Transparent objective score (0-100); not a measured benchmark. Lower latency/cpu/events is preferred.
-        return round(max(0, min(100, 100 - x["avg_latency_ms"] / max(x["target_latency_ms"], 1) * 35 - x["avg_cpu_percent"] * .25 - x["scaling_events"] * .7)), 2)
-    ranked = sorted([{"strategy": k, **v, "evaluation_score": score(v)} for k,v in results.items()], key=lambda x:x["evaluation_score"], reverse=True)
-    derived_source = next(iter(results.values()), {}).get("source", "SIMULATED_WORKLOAD")
-    return {"experiment_id": experiment_id, "status": row["status"], "source": derived_source, "score_formula": "100 - 35*(avg_latency/latency_target) - 0.25*avg_cpu - 0.7*scaling_events; clamped 0..100", "strategies": ranked}
+        row = c.execute("SELECT * FROM experiments WHERE id=?", (experiment_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "Experiment not found")
+    mode = experiment_mode(row["source"])
+    report = {
+        "experiment_id": experiment_id, "status": row["status"], "source": row["source"], "mode": mode,
+        "error": row["error"], "data_quality": experiment_data_quality(row),
+        "score_formula": None, "strategies": [], "baseline": None,
+    }
+    if row["status"] != "COMPLETED":
+        return report
+    results, baseline = experiment_results(row)
+    if mode == "SIMULATION":
+        strategies = [{"strategy": name, **result, "evaluation_score": simulation_score(result)}
+                      for name, result in results.items()]
+        report["strategies"] = sorted(strategies, key=lambda result: result["evaluation_score"], reverse=True)
+        report["score_formula"] = SCORE_FORMULA
+        if baseline is not None:
+            report["baseline"] = {"strategy": "BASELINE", **baseline}
+    else:
+        report["strategies"] = [{"strategy": name, **result} for name, result in results.items()]
+    return report
 
 @app.get("/api/v1/stream")
 async def stream():
@@ -727,7 +998,6 @@ def host_metrics():
 @app.get("/api/v1/infrastructure/status")
 def infrastructure_status():
     """Live status: Docker containers, Prometheus health, Grafana health."""
-    import httpx
     containers = []
     docker_connected = False
     try:
@@ -773,40 +1043,24 @@ def infrastructure_status():
     }
 
 
-@app.get("/api/v1/infrastructure/recommendations")
+@app.get("/api/v1/infrastructure/recommendations", dependencies=[Depends(get_current_user)])
 def infrastructure_recommendations():
     """Accurate HPA-style recommendations using full metric history for TREND detection."""
-    import httpx
     if not PROMETHEUS_URL:
         raise HTTPException(503, "Prometheus not configured")
-    values: dict = {}
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            for key, query in PROMETHEUS_QUERIES.items():
-                try:
-                    r = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query})
-                    r.raise_for_status()
-                    result = r.json().get("data", {}).get("result", [])
-                    nums = [float(item["value"][1]) for item in result
-                            if len(item.get("value", [])) > 1
-                            and item["value"][1] not in ("NaN", "+Inf", "-Inf")]
-                    values[key] = round(sum(nums) / len(nums), 3) if nums else None
-                except Exception:
-                    values[key] = None
-    except Exception as exc:
-        raise HTTPException(502, f"Cannot reach Prometheus: {exc}")
-
-    cpu     = values.get("cpu_percent")    or 0.0
-    latency = values.get("p95_latency_ms") or 0.0
-    rate    = values.get("request_rate")   or 0.0
+    keys = ("cpu_percent", "p95_latency_ms", "request_rate")
+    values = query_prometheus_metrics(keys)
+    missing = [key for key in keys if values[key] is None]
+    if missing:
+        raise HTTPException(503, detail={"message": "Incomplete Prometheus telemetry", "missing_metrics": missing})
+    cpu, latency, rate = (values[key] for key in keys)
 
     # Real workload replica count (K8s → kubectl → Docker workload → 1)
     replicas, replica_source = _get_workload_replicas()
 
     # Build rate history from rolling window for accurate TREND detection
     with _history_lock:
-        history = list(_metric_history)
-    rate_history = [h["rate"] for h in history]
+        rate_history = list(_metric_history)
     rate_history.append(rate)  # include current reading
 
     recs: dict = {}
@@ -876,31 +1130,8 @@ def prometheus_snapshot():
     """
     if not PROMETHEUS_URL:
         raise HTTPException(503, "Prometheus is not configured. Set PROMETHEUS_URL (for example http://localhost:9090) and restart the API.")
-    import httpx
-    values = {}
-    missing = []
-    try:
-        with httpx.Client(timeout=3.0) as client:
-            for key, query in PROMETHEUS_QUERIES.items():
-                try:
-                    response = client.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query})
-                    response.raise_for_status()
-                    body = response.json()
-                    result = body.get("data", {}).get("result", [])
-                    if not result:
-                        values[key] = None
-                        missing.append(key)
-                        continue
-                    # Aggregate queries should return one row; if not, average returned series.
-                    nums = [float(item["value"][1]) for item in result if len(item.get("value", [])) > 1 and item["value"][1] not in ("NaN", "+Inf", "-Inf")]
-                    values[key] = round(sum(nums) / len(nums), 3) if nums else None
-                    if values[key] is None:
-                        missing.append(key)
-                except (httpx.HTTPError, ValueError, KeyError, TypeError):
-                    values[key] = None
-                    missing.append(key)
-    except httpx.HTTPError as exc:
-        raise HTTPException(502, f"Could not reach configured Prometheus endpoint: {exc}")
+    values = query_prometheus_metrics(tuple(PROMETHEUS_QUERIES))
+    missing = [key for key, value in values.items() if value is None]
     return {"timestamp": now_iso(), "source": "PROMETHEUS", "status": "ok" if not missing else "partial",
             "values": values, "missing_metrics": missing,
             "note": "Null values mean the configured query returned no usable sample. Verify exporter names and scrape targets; values are never filled with mock numbers."}
